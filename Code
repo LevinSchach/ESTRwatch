@@ -1,0 +1,269 @@
+%spark.pyspark
+import pandas as pd
+current_deposit_facility = z.input("Current deposit facility:")
+current_deposit_facility = float(current_deposit_facility)
+
+rate_changes = {
+    pd.Timestamp('2024-10-17'): None,
+    pd.Timestamp('2024-12-12'): None,
+    pd.Timestamp('2025-01-30'): None,
+    pd.Timestamp('2025-03-06'): None,
+    pd.Timestamp('2025-04-17'): None,
+    pd.Timestamp('2025-06-05'): None,
+    #pd.Timestamp('2025-07-24'): None,
+    #pd.Timestamp('2025-09-11'): None,
+    #pd.Timestamp('2025-10-30'): None,
+    #pd.Timestamp('2025-12-18'): None
+}
+
+for date in rate_changes.keys():
+    value = z.select(f"Enter the expected rate decision for {date.date()} :", 
+                     [("-0.5", "-0.5"), ("-0.25", "-0.25"), ("0", "0"), ("0.25", "0.25"), ("0.5", "0.5")], 
+                     "0")
+    rate_changes[date] = float(value)
+
+print("Entered rate decisions:")
+for date, value in rate_changes.items():
+    print(f"{date.date()}: {value}")
+print(f"deposit facility: {current_deposit_facility}")
+
+
+print("""
+%angular
+<div class="container">
+    <h2>ECB Rate Decision Simulator</h2>
+    <div> The ESTR Rate Decision Simulator is a tool to to simulate the impact of central bank decisions on the ESTR rate.</div>
+    <div>&nbsp;</div>
+    <div> You can find the current deposit facility under: https://www.ecb.europa.eu/mopo/implement/sf/html/index.en.html </div>
+    <div>&nbsp;</div>
+    <div>&nbsp;</div>
+
+
+    <form>
+        <div ng-repeat="(date, value) in rateChanges">
+            <label>{{date | date:'yyyy-MM-dd'}}: </label>
+            <select ng-model="rateChanges[date]">
+                <option value="-0.5">-0.5</option>
+                <option value="-0.25">-0.25</option>
+                <option value="0">0</option>
+                <option value="0.25">0.25</option>
+                <option value="0.5">0.5</option>
+            </select>
+        </div>
+        <div class="col-md-1">
+            <button type="submit" class="btn btn-primary btn-run" ng-click="
+            
+                z.runParagraph('20240912-114348_1000737581');
+               ">Run</button>
+        </div>
+    </form>
+</div>
+<style>
+    .btn-run {
+        margin-top: 50px;
+    }
+    
+    .ui-datepicker-month {
+        background-color: #333333;
+    }
+    
+    .ui-datepicker-year {
+        background-color: #333333;
+    }
+</style>
+<script>
+angular.module('myApp', []).controller('RateChangeCtrl', function($scope) {
+    $scope.rateChanges = """ + str(rate_changes) + """;
+    $scope.submitChanges = function() {
+        console.log($scope.rateChanges);
+    };
+});
+</script>
+""")
+
+#                z.runParagraph('');
+
+
+%spark.pyspark
+import matplotlib.pyplot as plt
+from pandas.tseries.offsets import BDay
+import numpy as np
+from itertools import product
+
+
+ester_price['FACT_DATE'] = pd.to_datetime(ester_price['FACT_DATE'])
+ester_price['EXPIRY'] = pd.to_datetime(ester_price['EXPIRY'])
+
+def ester_clean(df, column):
+    Q1 = df[column].quantile(0.25)
+    Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1
+    return df[~((df[column] < (Q1 - 1.5 * IQR)) | (df[column] > (Q3 + 1.5 * IQR)))]
+
+ester_price_front = ester_price[ester_price['EXP_RANK'] == 1].copy()
+ester_cleaned = ester_clean(ester_price_front, 'SETTLEMENT_PRICE')
+ester_cleaned = ester_cleaned[ester_cleaned['FACT_DATE'] != pd.Timestamp('2023-04-24')]
+
+# ECB policy rate & Spread calculation
+ester_cleaned['rate'] = 100 - ester_cleaned['SETTLEMENT_PRICE']
+#current_deposit_facility = 3.75
+last_ester_price = ester_cleaned['rate'].iloc[-1]
+ester_ezc_spread = last_ester_price - current_deposit_facility
+
+print(f"ESTR-ECB Spread: {ester_ezc_spread}")
+
+last_day = ester_cleaned['FACT_DATE'].max()
+end_day = pd.Timestamp("2025-12-31")
+new_dates = pd.date_range(start=last_day + BDay(1), end=end_day, freq=BDay())
+simulated_dates = pd.DataFrame({'FACT_DATE': new_dates})
+
+simulated_dates['rate_change'] = simulated_dates['FACT_DATE'].map(
+    lambda date: sum(change for change_date, change in rate_changes.items() if date >= change_date)
+)
+
+simulated_dates['rate'] = current_deposit_facility + ester_ezc_spread + simulated_dates['rate_change']
+ester_forecasted = pd.concat([ester_cleaned, simulated_dates], ignore_index=True)
+ester_forecasted = ester_forecasted.sort_values('FACT_DATE').drop_duplicates(subset='FACT_DATE', keep='first')
+
+# Ester Rate Forecast Plot
+plt.figure(figsize=(10, 6))
+plt.plot(ester_forecasted['FACT_DATE'], ester_forecasted['rate'])
+plt.xlabel('Fact Date')
+plt.ylabel('Rate')
+plt.title('ESTR Rate History and Forecast')
+plt.grid()
+plt.show()
+
+# Term Structure
+latest_date = ester_price['FACT_DATE'].max()
+term_structure = ester_price[ester_price['FACT_DATE'] == latest_date].sort_values('EXP_RANK')
+
+def calculate_simulated_prices(start_price, expiry_dates, rate_changes):
+    simulated_prices = []
+    current_price = start_price
+    last_change_date = pd.Timestamp.min
+    for date in expiry_dates:
+        changes = [(change_date, change) for change_date, change in rate_changes.items() if last_change_date < change_date <= date]
+        if changes:
+            current_price -= sum(change for _, change in changes)
+            last_change_date = max(change_date for change_date, _ in changes)
+        simulated_prices.append(current_price)
+    return simulated_prices
+
+start_price = term_structure['SETTLEMENT_PRICE'].iloc[0]
+simulated_prices = calculate_simulated_prices(start_price, term_structure['EXPIRY'], rate_changes)
+
+output_df = pd.DataFrame({
+    'Expiry': term_structure['EXPIRY'],
+    'Prediction': simulated_prices,
+    'Current': term_structure['SETTLEMENT_PRICE'],
+    'Diff': [sim - curr for sim, curr in zip(simulated_prices, term_structure['SETTLEMENT_PRICE'])]
+})
+
+#print(output_df)
+
+def optimize_discrete_rate_changes(current_prices, expiry_dates, start_price, ecb_dates):
+    possible_changes = [-0.5, -0.25, 0, 0.25, 0.5]
+    best_changes = None
+    best_mse = float('inf')
+    
+    # gen combinations
+    all_combinations = product(possible_changes, repeat=len(ecb_dates))
+    
+    for combination in all_combinations:
+        temp_changes = dict(zip(ecb_dates, combination))
+        simulated_prices = calculate_prices_with_changes(start_price, expiry_dates, temp_changes)
+        
+        mse = np.mean((np.array(simulated_prices) - np.array(current_prices))**2)
+        
+        if mse < best_mse:
+            best_mse = mse
+            best_changes = temp_changes
+    
+    return best_changes
+
+def calculate_prices_with_changes(start_price, expiry_dates, rate_changes):
+    prices = []
+    current_price = start_price
+    last_change_date = pd.Timestamp.min
+    
+    for date in expiry_dates:
+        changes = [change for change_date, change in rate_changes.items() if last_change_date < change_date <= date]
+        if changes:
+            current_price -= sum(changes)
+            last_change_date = max(change_date for change_date in rate_changes.keys() if last_change_date < change_date <= date)
+        prices.append(current_price)
+    
+    return prices
+
+optimized_changes = optimize_discrete_rate_changes(term_structure['SETTLEMENT_PRICE'], 
+                                                   term_structure['EXPIRY'], 
+                                                   start_price,
+                                                   rate_changes)
+
+optimized_prices = calculate_prices_with_changes(start_price, term_structure['EXPIRY'], optimized_changes)
+
+
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
+
+ax1.plot(term_structure['EXP_RANK'], term_structure['SETTLEMENT_PRICE'], marker='o', linestyle='-', label='Current Term Structure')
+ax1.plot(term_structure['EXP_RANK'], simulated_prices, marker='s', linestyle='--', color='red', label='Simulated ECB Traget Rate')
+ax1.plot(term_structure['EXP_RANK'], optimized_prices, marker='^', linestyle='-.', color='green', label='Optimized ECB Decision Term Structure')
+ax1.set_ylabel('Price')
+ax1.tick_params(axis='y')
+ax1.legend(loc='upper left')
+ax1.grid(True, linestyle='--', alpha=0.7)
+
+diff_simulated = [sim - curr for sim, curr in zip(simulated_prices, term_structure['SETTLEMENT_PRICE'])]
+diff_optimized = [opt - curr for opt, curr in zip(optimized_prices, term_structure['SETTLEMENT_PRICE'])]
+
+bar_width = 0.35
+index = np.arange(len(term_structure['EXP_RANK']))
+
+bars1 = ax2.bar(index, diff_simulated, bar_width, alpha=0.6, color='red', label='ECB Target Rate Difference')
+bars2 = ax2.bar(index + bar_width, diff_optimized, bar_width, alpha=0.6, color='green', label='Optimized ECB Decision Term Structure')
+
+ax2.set_ylabel('Difference')
+ax2.set_xlabel('Expiry Rank')
+ax2.tick_params(axis='y')
+ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+ax2.grid(True, linestyle='--', alpha=0.7)
+ax2.legend()
+
+def add_labels(bars):
+    for bar in bars:
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height,
+                 f'{height:.2f}',
+                 ha='center', va='bottom' if height > 0 else 'top')
+
+add_labels(bars1)
+add_labels(bars2)
+
+fig.suptitle(f'Term structure of {latest_date.strftime("%Y-%m-%d")}', fontsize=16)
+
+plt.tight_layout()
+plt.show()
+
+print("Optimized Discrete Rate Changes:")
+for date, change in optimized_changes.items():
+    print(f"{date.date()}: {change:.2f},")
+    print()
+
+    
+    
+print("""
+%angular
+<div class="container">
+    <h2>ESTR Rate History and Forecast</h2>
+    <div> This plot shows the ESTR rate over time, combining historical data with a future projection. The historical ppath shows the actual ESTR rate up to the current date. The future segment is a simulation based on pre defined ECB policy decisions. </div>
+    <div>&nbsp;</div>
+    <h2>Term structure Comparison</h2>
+    <div>This plot visualizes the <b>current term structure, the optimized ECB decision term strucure and a simulated ECB target rate</b>.  </div>
+    <div>&nbsp;</div>
+    <div><b>Optimized term structure:</b> A simulated curve that aims to replicate the current term structure as close as possible. It is generated by finding the optimal set of ECB rate decisions at future meetings, that would best reproduce the current market expectations </div>
+    <div>&nbsp;</div>
+    <div><b>Simulated ECB target rate:</b> This line serves as the best indicator for the final settlement price of expiring contracts. The simulation is based on the pre defined rate decisions. If the actual ECB decisions differ from what the current term structure implies, the price will adjust towards this target rate. It shows where the price would settle if our defined rate decisions, rather than the market's current expectations, prove to be right.</div>
+</div>
+""")
